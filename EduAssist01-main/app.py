@@ -9,22 +9,42 @@ from flask import (Flask, request, redirect, url_for, flash, render_template,
                    send_from_directory, abort)
 from jinja2 import DictLoader
 from sqlalchemy.engine import URL
+from sqlalchemy.pool import NullPool
 from sqlalchemy import (create_engine, MetaData, Table, Column, Integer, String, Text, text)
 from werkzeug.utils import secure_filename
 
-if os.getenv("DB_NAME"):   # MySQL (or MariaDB / XAMPP)
+ON_VERCEL = bool(os.getenv("VERCEL"))   # Vercel's filesystem is read-only except /tmp
+
+if os.getenv("DATABASE_URL"):   # full URL, e.g. mysql+pymysql://user:pass@host:3306/dbname
+    _u = os.getenv("DATABASE_URL")
+    if _u.startswith("mysql://"):
+        _u = "mysql+pymysql://" + _u[len("mysql://"):]
+    DB_URL = _u
+elif os.getenv("DB_NAME"):   # MySQL (or MariaDB / XAMPP / hosted MySQL)
     DB_URL = URL.create("mysql+pymysql", username=os.getenv("DB_USER", "root"),
                         password=os.getenv("DB_PASSWORD", ""), host=os.getenv("DB_HOST", "localhost"),
                         port=int(os.getenv("DB_PORT", 3306)), database=os.getenv("DB_NAME"),
                         query={"charset": "utf8mb4"})
 else:                      # fallback so the app still runs with no MySQL yet
-    DB_URL = os.getenv("DATABASE_URL", "sqlite:///classroom.db")
-UPLOAD_DIR = os.path.abspath(os.getenv("UPLOAD_DIR", "uploads"))
+    DB_URL = "sqlite:////tmp/classroom.db" if ON_VERCEL else "sqlite:///classroom.db"
+UPLOAD_DIR = os.path.abspath(os.getenv("UPLOAD_DIR", "/tmp/uploads" if ON_VERCEL else "uploads"))
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-me-please")
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
-engine = create_engine(DB_URL, pool_pre_ping=True, pool_recycle=280)
+
+_engine_args = {"pool_pre_ping": True}
+if ON_VERCEL:
+    _engine_args["poolclass"] = NullPool   # serverless: open/close a connection per request
+else:
+    _engine_args["pool_recycle"] = 280
+if str(DB_URL).startswith("mysql") and os.getenv("DB_SSL", "").lower() in ("1", "true", "yes"):
+    try:
+        import certifi
+        _engine_args["connect_args"] = {"ssl": {"ca": certifi.where()}}
+    except ImportError:
+        _engine_args["connect_args"] = {"ssl": {"fake_flag_to_enable_tls": True}}
+engine = create_engine(DB_URL, **_engine_args)
 
 # ---------------------------------------------------------------- database
 md = MetaData()
@@ -703,14 +723,26 @@ app.jinja_env.loader = DictLoader({"base.html": BASE, "dash.html": DASH, "plans.
     "grades.html": GRADES, "section.html": SECTION, "bin.html": BIN, 
     "notifs.html": NOTIFS, "settings.html": SETTINGS})
 
-md.create_all(engine)
-for _s in q("SELECT id,scheme FROM sections"):   # auto-upgrade sections saved in the old grading format
-    _sc = json.loads(_s["scheme"])
-    if _sc and isinstance(_sc[0], list):
-        ex("UPDATE sections SET scheme=:c WHERE id=:i", i=_s["id"],
-           c=json.dumps([dict(name=n, weight=float(w), parts=[new_part(n)]) for n, w in _sc]))
-if not one("SELECT id FROM sections LIMIT 1") and not os.getenv("NO_DEMO"):
-    log("Welcome! Add sections under Grades and upload files under Lesson Plans.")
+STARTUP_ERROR = None
+try:
+    md.create_all(engine)
+    for _s in q("SELECT id,scheme FROM sections"):   # auto-upgrade sections saved in the old grading format
+        _sc = json.loads(_s["scheme"])
+        if _sc and isinstance(_sc[0], list):
+            ex("UPDATE sections SET scheme=:c WHERE id=:i", i=_s["id"],
+               c=json.dumps([dict(name=n, weight=float(w), parts=[new_part(n)]) for n, w in _sc]))
+    if not one("SELECT id FROM sections LIMIT 1") and not os.getenv("NO_DEMO"):
+        log("Welcome! Add sections under Grades and upload files under Lesson Plans.")
+except Exception as _e:   # e.g. database unreachable: show a readable message instead of a blank 500
+    STARTUP_ERROR = f"{type(_e).__name__}: {_e}"
+    print("STARTUP ERROR:", STARTUP_ERROR)
+
+@app.before_request
+def _startup_guard():
+    if STARTUP_ERROR:
+        return ("<h2>Database connection failed</h2><p>Check DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / "
+                "DB_NAME (and DB_SSL=1 if your host requires SSL) in Vercel -> Settings -> Environment "
+                "Variables, then redeploy.</p><pre>" + STARTUP_ERROR.replace("<", "&lt;") + "</pre>"), 500
 
 if __name__ == "__main__":
     app.run(debug=True, port=int(os.getenv("PORT", 5000)))
