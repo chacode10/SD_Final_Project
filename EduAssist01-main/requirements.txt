@@ -1,0 +1,6 @@
+Flask>=3.0
+SQLAlchemy>=2.0
+PyMySQL>=1.1
+cryptography>=42.0
+cloudinary>=1.40
+python-dotenv>=1.0
